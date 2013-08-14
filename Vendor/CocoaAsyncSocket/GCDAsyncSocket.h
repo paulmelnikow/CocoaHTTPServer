@@ -17,6 +17,8 @@
 @class GCDAsyncWritePacket;
 @class GCDAsyncSocketPreBuffer;
 
+#define USING_SECURE_TRANSPORT 0
+
 #if TARGET_OS_IPHONE
 
   // Compiling for iOS
@@ -29,6 +31,10 @@
       #define SECURE_TRANSPORT_MAYBE_AVAILABLE   1
       #define SECURE_TRANSPORT_MAYBE_UNAVAILABLE 0
 
+      #ifndef USING_SECURE_TRANSPORT
+        #define USING_SECURE_TRANSPORT YES
+      #endif
+
     #else                                         // iOS 5.0 supported but not required
 
       #ifndef NSFoundationVersionNumber_iPhoneOS_5_0
@@ -39,6 +45,10 @@
       #define SECURE_TRANSPORT_MAYBE_AVAILABLE   1
       #define SECURE_TRANSPORT_MAYBE_UNAVAILABLE 1
 
+      #ifndef USING_SECURE_TRANSPORT
+        #define USING_SECURE_TRANSPORT (NSFoundationVersionNumber >= NSFoundationVersionNumber_iPhoneOS_5_0)
+      #endif
+
     #endif
 
   #else                                        // iOS 5.0 not supported
@@ -47,15 +57,23 @@
     #define SECURE_TRANSPORT_MAYBE_AVAILABLE   0
     #define SECURE_TRANSPORT_MAYBE_UNAVAILABLE 1
 
+    #ifndef USING_SECURE_TRANSPORT
+      #define USING_SECURE_TRANSPORT NO
+    #endif
+
   #endif
 
 #else
 
   // Compiling for Mac OS X
 
-  #define IS_SECURE_TRANSPORT_AVAILABLE      YES
-  #define SECURE_TRANSPORT_MAYBE_AVAILABLE   1
-  #define SECURE_TRANSPORT_MAYBE_UNAVAILABLE 0
+  #define IS_SECURE_TRANSPORT_AVAILABLE      NO
+  #define SECURE_TRANSPORT_MAYBE_AVAILABLE   0
+  #define SECURE_TRANSPORT_MAYBE_UNAVAILABLE 1
+
+  #ifndef USING_SECURE_TRANSPORT
+    #define USING_SECURE_TRANSPORT NO
+  #endif
 
 #endif
 
@@ -65,7 +83,7 @@ extern NSString *const GCDAsyncSocketErrorDomain;
 extern NSString *const GCDAsyncSocketQueueName;
 extern NSString *const GCDAsyncSocketThreadName;
 
-#if SECURE_TRANSPORT_MAYBE_AVAILABLE
+#if USING_SECURE_TRANSPORT
 extern NSString *const GCDAsyncSocketSSLCipherSuites;
 #if TARGET_OS_IPHONE
 extern NSString *const GCDAsyncSocketSSLProtocolVersionMin;

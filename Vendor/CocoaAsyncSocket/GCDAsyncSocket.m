@@ -10,7 +10,7 @@
 
 #import "GCDAsyncSocket.h"
 
-#if TARGET_OS_IPHONE
+#if !USING_SECURE_TRANSPORT
 #import <CFNetwork/CFNetwork.h>
 #endif
 
@@ -131,7 +131,7 @@ NSString *const GCDAsyncSocketErrorDomain = @"GCDAsyncSocketErrorDomain";
 NSString *const GCDAsyncSocketQueueName = @"GCDAsyncSocket";
 NSString *const GCDAsyncSocketThreadName = @"GCDAsyncSocket-CFStream";
 
-#if SECURE_TRANSPORT_MAYBE_AVAILABLE
+#if USING_SECURE_TRANSPORT
 NSString *const GCDAsyncSocketSSLCipherSuites = @"GCDAsyncSocketSSLCipherSuites";
 #if TARGET_OS_IPHONE
 NSString *const GCDAsyncSocketSSLProtocolVersionMin = @"GCDAsyncSocketSSLProtocolVersionMin";
@@ -159,9 +159,11 @@ enum GCDAsyncSocketFlags
 	kSocketSecure                  = 1 << 13,  // If set, socket is using secure communication via SSL/TLS
 	kSocketHasReadEOF              = 1 << 14,  // If set, we have read EOF from socket
 	kReadStreamClosed              = 1 << 15,  // If set, we've read EOF plus prebuffer has been drained
-#if TARGET_OS_IPHONE
+#if !USING_SECURE_TRANSPORT
 	kAddedStreamsToRunLoop         = 1 << 16,  // If set, CFStreams have been added to listener thread
+#endif
 	kUsingCFStreamForTLS           = 1 << 17,  // If set, we're forced to use CFStream instead of SecureTransport
+#if !USING_SECURE_TRANSPORT
 	kSecureSocketHasBytesAvailable = 1 << 18,  // If set, CFReadStream has notified us of bytes available
 #endif
 };
@@ -174,7 +176,7 @@ enum GCDAsyncSocketConfig
 	kAllowHalfDuplexConnection = 1 << 3,  // If set, the socket will stay open even if the read stream closes
 };
 
-#if TARGET_OS_IPHONE
+#if !USING_SECURE_TRANSPORT
   static NSThread *cfstreamThread;  // Used for CFStreams
 #endif
 
@@ -216,16 +218,15 @@ enum GCDAsyncSocketConfig
 	
 	GCDAsyncSocketPreBuffer *preBuffer;
 		
-#if TARGET_OS_IPHONE
-	CFStreamClientContext streamContext;
-	CFReadStreamRef readStream;
-	CFWriteStreamRef writeStream;
-#endif
-#if SECURE_TRANSPORT_MAYBE_AVAILABLE
+#if USING_SECURE_TRANSPORT
 	SSLContextRef sslContext;
 	GCDAsyncSocketPreBuffer *sslPreBuffer;
 	size_t sslWriteCachedLength;
 	OSStatus sslErrCode;
+#else
+    CFStreamClientContext streamContext;
+	CFReadStreamRef readStream;
+	CFWriteStreamRef writeStream;
 #endif
 	
 	void *IsOnSocketQueueOrTargetQueueKey;
@@ -310,16 +311,15 @@ enum GCDAsyncSocketConfig
 
 // Security
 - (void)maybeStartTLS;
-#if SECURE_TRANSPORT_MAYBE_AVAILABLE
+#if USING_SECURE_TRANSPORT
 - (void)ssl_startTLS;
 - (void)ssl_continueSSLHandshake;
-#endif
-#if TARGET_OS_IPHONE
+#else
 - (void)cf_startTLS;
 #endif
 
 // CFStream
-#if TARGET_OS_IPHONE
+#if !USING_SECURE_TRANSPORT
 + (void)startCFStreamThreadIfNeeded;
 - (BOOL)createReadAndWriteStream;
 - (BOOL)registerForStreamCallbacksIncludingReadWrite:(BOOL)includeReadWrite;
@@ -2672,8 +2672,29 @@ enum GCDAsyncSocketConfig
 	[writeQueue removeAllObjects];
 	
 	[preBuffer reset];
-	
-	#if TARGET_OS_IPHONE
+    
+    #if USING_SECURE_TRANSPORT
+	{
+		[sslPreBuffer reset];
+		sslErrCode = noErr;
+		
+		if (sslContext)
+		{
+			// Getting a linker error here about the SSLx() functions?
+			// You need to add the Security Framework to your application.
+			
+			SSLClose(sslContext);
+			
+            #if TARGET_OS_IPHONE
+			CFRelease(sslContext);
+            #else
+			SSLDisposeContext(sslContext);
+            #endif
+			
+			sslContext = NULL;
+		}
+	}
+    #else
 	{
 		if (readStream || writeStream)
 		{
@@ -2696,28 +2717,7 @@ enum GCDAsyncSocketConfig
 		}
 	}
 	#endif
-	#if SECURE_TRANSPORT_MAYBE_AVAILABLE
-	{
-		[sslPreBuffer reset];
-		sslErrCode = noErr;
-		
-		if (sslContext)
-		{
-			// Getting a linker error here about the SSLx() functions?
-			// You need to add the Security Framework to your application.
-			
-			SSLClose(sslContext);
-			
-			#if TARGET_OS_IPHONE
-			CFRelease(sslContext);
-			#else
-			SSLDisposeContext(sslContext);
-			#endif
-			
-			sslContext = NULL;
-		}
-	}
-	#endif
+
 	
 	// For some crazy reason (in my opinion), cancelling a dispatch source doesn't
 	// invoke the cancel handler if the dispatch source is paused.
@@ -3720,32 +3720,20 @@ enum GCDAsyncSocketConfig
 
 - (BOOL)usingCFStreamForTLS
 {
-	#if TARGET_OS_IPHONE
-	{	
-		if ((flags & kSocketSecure) && (flags & kUsingCFStreamForTLS))
-		{
-			// Due to the fact that Apple doesn't give us the full power of SecureTransport on iOS,
-			// we are relegated to using the slower, less powerful, and RunLoop based CFStream API. :( Boo!
-			// 
-			// Thus we're not able to use the GCD read/write sources in this particular scenario.
-			
-			return YES;
-		}
-	}
-	#endif
-	
-	return NO;
+    return (flags & kSocketSecure) && (flags & kUsingCFStreamForTLS);
 }
 
 - (BOOL)usingSecureTransportForTLS
 {
-	#if TARGET_OS_IPHONE
+    #if USING_SECURE_TRANSPORT
 	{
-		return ![self usingCFStreamForTLS];
+		return (flags & kSocketSecure) && (flags & kUsingCFStreamForTLS);
 	}
-	#endif
-	
-	return YES;
+	#else
+    {
+        return NO;
+    }
+    #endif
 }
 
 - (void)suspendReadSource
@@ -4093,47 +4081,18 @@ enum GCDAsyncSocketConfig
 		return;
 	}
 	
-#if TARGET_OS_IPHONE
-	
-	if ([self usingCFStreamForTLS])
-	{
-		if ((flags & kSecureSocketHasBytesAvailable) && CFReadStreamHasBytesAvailable(readStream))
-		{
-			LogVerbose(@"%@ - Flushing ssl buffers into prebuffer...", THIS_METHOD);
-			
-			CFIndex defaultBytesToRead = (1024 * 4);
-			
-			[preBuffer ensureCapacityForWrite:defaultBytesToRead];
-			
-			uint8_t *buffer = [preBuffer writeBuffer];
-			
-			CFIndex result = CFReadStreamRead(readStream, buffer, defaultBytesToRead);
-			LogVerbose(@"%@ - CFReadStreamRead(): result = %i", THIS_METHOD, (int)result);
-			
-			if (result > 0)
-			{
-				[preBuffer didWrite:result];
-			}
-			
-			flags &= ~kSecureSocketHasBytesAvailable;
-		}
-		
-		return;
-	}
-	
-#endif
-#if SECURE_TRANSPORT_MAYBE_AVAILABLE
-	
-	__block NSUInteger estimatedBytesAvailable = 0;
+#if USING_SECURE_TRANSPORT
+    
+    __block NSUInteger estimatedBytesAvailable = 0;
 	
 	dispatch_block_t updateEstimatedBytesAvailable = ^{
 		
 		// Figure out if there is any data available to be read
-		// 
+		//
 		// socketFDBytesAvailable        <- Number of encrypted bytes we haven't read from the bsd socket
 		// [sslPreBuffer availableBytes] <- Number of encrypted bytes we've buffered from bsd socket
 		// sslInternalBufSize            <- Number of decrypted bytes SecureTransport has buffered
-		// 
+		//
 		// We call the variable "estimated" because we don't know how many decrypted bytes we'll get
 		// from the encrypted bytes in the sslPreBuffer.
 		// However, we do know this is an upper bound on the estimation.
@@ -4187,8 +4146,32 @@ enum GCDAsyncSocketConfig
 			
 		} while (!done && estimatedBytesAvailable > 0);
 	}
+
+#else
 	
+    if ((flags & kSecureSocketHasBytesAvailable) && CFReadStreamHasBytesAvailable(readStream))
+    {
+        LogVerbose(@"%@ - Flushing ssl buffers into prebuffer...", THIS_METHOD);
+        
+        CFIndex defaultBytesToRead = (1024 * 4);
+        
+        [preBuffer ensureCapacityForWrite:defaultBytesToRead];
+        
+        uint8_t *buffer = [preBuffer writeBuffer];
+        
+        CFIndex result = CFReadStreamRead(readStream, buffer, defaultBytesToRead);
+        LogVerbose(@"%@ - CFReadStreamRead(): result = %i", THIS_METHOD, (int)result);
+        
+        if (result > 0)
+        {
+            [preBuffer didWrite:result];
+        }
+        
+        flags &= ~kSecureSocketHasBytesAvailable;
+    }
+
 #endif
+	
 }
 
 - (void)doReadData
@@ -4247,80 +4230,73 @@ enum GCDAsyncSocketConfig
 	BOOL hasBytesAvailable = NO;
 	unsigned long estimatedBytesAvailable = 0;
 	
-	if ([self usingCFStreamForTLS])
-	{
-		#if TARGET_OS_IPHONE
-		
-		// Relegated to using CFStream... :( Boo! Give us a full SecureTransport stack Apple!
-		
-		estimatedBytesAvailable = 0;
-		if ((flags & kSecureSocketHasBytesAvailable) && CFReadStreamHasBytesAvailable(readStream))
-			hasBytesAvailable = YES;
-		else
-			hasBytesAvailable = NO;
-		
-		#endif
-	}
-	else
-	{
-		#if SECURE_TRANSPORT_MAYBE_AVAILABLE
-		
-		estimatedBytesAvailable = socketFDBytesAvailable;
-		
-		if (flags & kSocketSecure)
-		{
-			// There are 2 buffers to be aware of here.
-			// 
-			// We are using SecureTransport, a TLS/SSL security layer which sits atop TCP.
-			// We issue a read to the SecureTranport API, which in turn issues a read to our SSLReadFunction.
-			// Our SSLReadFunction then reads from the BSD socket and returns the encrypted data to SecureTransport.
-			// SecureTransport then decrypts the data, and finally returns the decrypted data back to us.
-			// 
-			// The first buffer is one we create.
-			// SecureTransport often requests small amounts of data.
-			// This has to do with the encypted packets that are coming across the TCP stream.
-			// But it's non-optimal to do a bunch of small reads from the BSD socket.
-			// So our SSLReadFunction reads all available data from the socket (optimizing the sys call)
-			// and may store excess in the sslPreBuffer.
-			
-			estimatedBytesAvailable += [sslPreBuffer availableBytes];
-			
-			// The second buffer is within SecureTransport.
-			// As mentioned earlier, there are encrypted packets coming across the TCP stream.
-			// SecureTransport needs the entire packet to decrypt it.
-			// But if the entire packet produces X bytes of decrypted data,
-			// and we only asked SecureTransport for X/2 bytes of data,
-			// it must store the extra X/2 bytes of decrypted data for the next read.
-			// 
-			// The SSLGetBufferedReadSize function will tell us the size of this internal buffer.
-			// From the documentation:
-			// 
-			// "This function does not block or cause any low-level read operations to occur."
-			
-			size_t sslInternalBufSize = 0;
-			SSLGetBufferedReadSize(sslContext, &sslInternalBufSize);
-			
-			estimatedBytesAvailable += sslInternalBufSize;
-		}
-		
-		hasBytesAvailable = (estimatedBytesAvailable > 0);
-		
-		#endif
-	}
-	
+    #if USING_SECURE_TRANSPORT
+
+    estimatedBytesAvailable = socketFDBytesAvailable;
+    
+    if (flags & kSocketSecure)
+    {
+        // There are 2 buffers to be aware of here.
+        //
+        // We are using SecureTransport, a TLS/SSL security layer which sits atop TCP.
+        // We issue a read to the SecureTranport API, which in turn issues a read to our SSLReadFunction.
+        // Our SSLReadFunction then reads from the BSD socket and returns the encrypted data to SecureTransport.
+        // SecureTransport then decrypts the data, and finally returns the decrypted data back to us.
+        //
+        // The first buffer is one we create.
+        // SecureTransport often requests small amounts of data.
+        // This has to do with the encypted packets that are coming across the TCP stream.
+        // But it's non-optimal to do a bunch of small reads from the BSD socket.
+        // So our SSLReadFunction reads all available data from the socket (optimizing the sys call)
+        // and may store excess in the sslPreBuffer.
+        
+        estimatedBytesAvailable += [sslPreBuffer availableBytes];
+        
+        // The second buffer is within SecureTransport.
+        // As mentioned earlier, there are encrypted packets coming across the TCP stream.
+        // SecureTransport needs the entire packet to decrypt it.
+        // But if the entire packet produces X bytes of decrypted data,
+        // and we only asked SecureTransport for X/2 bytes of data,
+        // it must store the extra X/2 bytes of decrypted data for the next read.
+        //
+        // The SSLGetBufferedReadSize function will tell us the size of this internal buffer.
+        // From the documentation:
+        //
+        // "This function does not block or cause any low-level read operations to occur."
+        
+        size_t sslInternalBufSize = 0;
+        SSLGetBufferedReadSize(sslContext, &sslInternalBufSize);
+        
+        estimatedBytesAvailable += sslInternalBufSize;
+    }
+    
+    hasBytesAvailable = (estimatedBytesAvailable > 0);
+
+    #else
+    
+    // Relegated to using CFStream... :( Boo! Give us a full SecureTransport stack Apple!
+    
+    estimatedBytesAvailable = 0;
+    if ((flags & kSecureSocketHasBytesAvailable) && CFReadStreamHasBytesAvailable(readStream))
+        hasBytesAvailable = YES;
+    else
+        hasBytesAvailable = NO;
+    
+    #endif
+    
 	if ((hasBytesAvailable == NO) && ([preBuffer availableBytes] == 0))
 	{
 		LogVerbose(@"No data available to read...");
 		
 		// No data available to read.
-		
-		if (![self usingCFStreamForTLS])
-		{
+        
+        #if USING_SECURE_TRANSPORT
 			// Need to wait for readSource to fire and notify us of
 			// available data in the socket's internal read buffer.
 			
 			[self resumeReadSource];
-		}
+        #endif
+        
 		return;
 	}
 	
@@ -4332,29 +4308,23 @@ enum GCDAsyncSocketConfig
 		
 		if (flags & kStartingWriteTLS)
 		{
-			if ([self usingSecureTransportForTLS])
-			{
-				#if SECURE_TRANSPORT_MAYBE_AVAILABLE
-			
-				// We are in the process of a SSL Handshake.
-				// We were waiting for incoming data which has just arrived.
-				
-				[self ssl_continueSSLHandshake];
-			
-				#endif
-			}
+            #if USING_SECURE_TRANSPORT
+            // We are in the process of a SSL Handshake.
+            // We were waiting for incoming data which has just arrived.
+            
+            [self ssl_continueSSLHandshake];
+            #endif
 		}
 		else
 		{
 			// We are still waiting for the writeQueue to drain and start the SSL/TLS process.
 			// We now know data is available to read.
 			
-			if (![self usingCFStreamForTLS])
-			{
-				// Suspend the read source or else it will continue to fire nonstop.
-				
-				[self suspendReadSource];
-			}
+            #if USING_SECURE_TRANSPORT
+            // Suspend the read source or else it will continue to fire nonstop.
+            
+            [self suspendReadSource];
+            #endif
 		}
 		
 		return;
@@ -4535,94 +4505,88 @@ enum GCDAsyncSocketConfig
 		
 		if (flags & kSocketSecure)
 		{
-			if ([self usingCFStreamForTLS])
-			{
-				#if TARGET_OS_IPHONE
-				
-				CFIndex result = CFReadStreamRead(readStream, buffer, (CFIndex)bytesToRead);
-				LogVerbose(@"CFReadStreamRead(): result = %i", (int)result);
-				
-				if (result < 0)
-				{
-					error = (__bridge_transfer NSError *)CFReadStreamCopyError(readStream);
-				}
-				else if (result == 0)
-				{
-					socketEOF = YES;
-				}
-				else
-				{
-					waiting = YES;
-					bytesRead = (size_t)result;
-				}
-				
-				// We only know how many decrypted bytes were read.
-				// The actual number of bytes read was likely more due to the overhead of the encryption.
-				// So we reset our flag, and rely on the next callback to alert us of more data.
-				flags &= ~kSecureSocketHasBytesAvailable;
-				
-				#endif
-			}
-			else
-			{
-				#if SECURE_TRANSPORT_MAYBE_AVAILABLE
-					
-				// The documentation from Apple states:
-				// 
-				//     "a read operation might return errSSLWouldBlock,
-				//      indicating that less data than requested was actually transferred"
-				// 
-				// However, starting around 10.7, the function will sometimes return noErr,
-				// even if it didn't read as much data as requested. So we need to watch out for that.
-				
-				OSStatus result;
-				do
-				{
-					void *loop_buffer = buffer + bytesRead;
-					size_t loop_bytesToRead = (size_t)bytesToRead - bytesRead;
-					size_t loop_bytesRead = 0;
-					
-					result = SSLRead(sslContext, loop_buffer, loop_bytesToRead, &loop_bytesRead);
-					LogVerbose(@"read from secure socket = %u", (unsigned)bytesRead);
-					
-					bytesRead += loop_bytesRead;
-					
-				} while ((result == noErr) && (bytesRead < bytesToRead));
-				
-				
-				if (result != noErr)
-				{
-					if (result == errSSLWouldBlock)
-						waiting = YES;
-					else
-					{
-						if (result == errSSLClosedGraceful || result == errSSLClosedAbort)
-						{
-							// We've reached the end of the stream.
-							// Handle this the same way we would an EOF from the socket.
-							socketEOF = YES;
-							sslErrCode = result;
-						}
-						else
-						{
-							error = [self sslError:result];
-						}
-					}
-					// It's possible that bytesRead > 0, even if the result was errSSLWouldBlock.
-					// This happens when the SSLRead function is able to read some data,
-					// but not the entire amount we requested.
-					
-					if (bytesRead <= 0)
-					{
-						bytesRead = 0;
-					}
-				}
-				
-				// Do not modify socketFDBytesAvailable.
-				// It will be updated via the SSLReadFunction().
-				
-				#endif
-			}
+            #if USING_SECURE_TRANSPORT
+                        
+            // The documentation from Apple states:
+            //
+            //     "a read operation might return errSSLWouldBlock,
+            //      indicating that less data than requested was actually transferred"
+            //
+            // However, starting around 10.7, the function will sometimes return noErr,
+            // even if it didn't read as much data as requested. So we need to watch out for that.
+            
+            OSStatus result;
+            do
+            {
+                void *loop_buffer = buffer + bytesRead;
+                size_t loop_bytesToRead = (size_t)bytesToRead - bytesRead;
+                size_t loop_bytesRead = 0;
+                
+                result = SSLRead(sslContext, loop_buffer, loop_bytesToRead, &loop_bytesRead);
+                LogVerbose(@"read from secure socket = %u", (unsigned)bytesRead);
+                
+                bytesRead += loop_bytesRead;
+                
+            } while ((result == noErr) && (bytesRead < bytesToRead));
+            
+            
+            if (result != noErr)
+            {
+                if (result == errSSLWouldBlock)
+                    waiting = YES;
+                else
+                {
+                    if (result == errSSLClosedGraceful || result == errSSLClosedAbort)
+                    {
+                        // We've reached the end of the stream.
+                        // Handle this the same way we would an EOF from the socket.
+                        socketEOF = YES;
+                        sslErrCode = result;
+                    }
+                    else
+                    {
+                        error = [self sslError:result];
+                    }
+                }
+                // It's possible that bytesRead > 0, even if the result was errSSLWouldBlock.
+                // This happens when the SSLRead function is able to read some data,
+                // but not the entire amount we requested.
+                
+                if (bytesRead <= 0)
+                {
+                    bytesRead = 0;
+                }
+            }
+            
+            // Do not modify socketFDBytesAvailable.
+            // It will be updated via the SSLReadFunction().
+            
+            #else
+            
+            CFIndex result = CFReadStreamRead(readStream, buffer, (CFIndex)bytesToRead);
+            LogVerbose(@"CFReadStreamRead(): result = %i", (int)result);
+            
+            if (result < 0)
+            {
+                error = (__bridge_transfer NSError *)CFReadStreamCopyError(readStream);
+            }
+            else if (result == 0)
+            {
+                socketEOF = YES;
+            }
+            else
+            {
+                waiting = YES;
+                bytesRead = (size_t)result;
+            }
+            
+            // We only know how many decrypted bytes were read.
+            // The actual number of bytes read was likely more due to the overhead of the encryption.
+            // So we reset our flag, and rely on the next callback to alert us of more data.
+            flags &= ~kSecureSocketHasBytesAvailable;
+            
+            #endif
+
 		}
 		else
 		{
@@ -5394,178 +5358,171 @@ enum GCDAsyncSocketConfig
 	
 	if (flags & kSocketSecure)
 	{
-		if ([self usingCFStreamForTLS])
-		{
-			#if TARGET_OS_IPHONE
+        #if USING_SECURE_TRANSPORT
+        
+        // We're going to use the SSLWrite function.
+        //
+        // OSStatus SSLWrite(SSLContextRef context, const void *data, size_t dataLength, size_t *processed)
+        //
+        // Parameters:
+        // context     - An SSL session context reference.
+        // data        - A pointer to the buffer of data to write.
+        // dataLength  - The amount, in bytes, of data to write.
+        // processed   - On return, the length, in bytes, of the data actually written.
+        //
+        // It sounds pretty straight-forward,
+        // but there are a few caveats you should be aware of.
+        //
+        // The SSLWrite method operates in a non-obvious (and rather annoying) manner.
+        // According to the documentation:
+        //
+        //   Because you may configure the underlying connection to operate in a non-blocking manner,
+        //   a write operation might return errSSLWouldBlock, indicating that less data than requested
+        //   was actually transferred. In this case, you should repeat the call to SSLWrite until some
+        //   other result is returned.
+        //
+        // This sounds perfect, but when our SSLWriteFunction returns errSSLWouldBlock,
+        // then the SSLWrite method returns (with the proper errSSLWouldBlock return value),
+        // but it sets processed to dataLength !!
+        //
+        // In other words, if the SSLWrite function doesn't completely write all the data we tell it to,
+        // then it doesn't tell us how many bytes were actually written. So, for example, if we tell it to
+        // write 256 bytes then it might actually write 128 bytes, but then report 0 bytes written.
+        //
+        // You might be wondering:
+        // If the SSLWrite function doesn't tell us how many bytes were written,
+        // then how in the world are we supposed to update our parameters (buffer & bytesToWrite)
+        // for the next time we invoke SSLWrite?
+        //
+        // The answer is that SSLWrite cached all the data we told it to write,
+        // and it will push out that data next time we call SSLWrite.
+        // If we call SSLWrite with new data, it will push out the cached data first, and then the new data.
+        // If we call SSLWrite with empty data, then it will simply push out the cached data.
+        //
+        // For this purpose we're going to break large writes into a series of smaller writes.
+        // This allows us to report progress back to the delegate.
+        
+        OSStatus result;
+        
+        BOOL hasCachedDataToWrite = (sslWriteCachedLength > 0);
+        BOOL hasNewDataToWrite = YES;
+        
+        if (hasCachedDataToWrite)
+        {
+            size_t processed = 0;
+            
+            result = SSLWrite(sslContext, NULL, 0, &processed);
+            
+            if (result == noErr)
+            {
+                bytesWritten = sslWriteCachedLength;
+                sslWriteCachedLength = 0;
+                
+                if ([currentWrite->buffer length] == (currentWrite->bytesDone + bytesWritten))
+                {
+                    // We've written all data for the current write.
+                    hasNewDataToWrite = NO;
+                }
+            }
+            else
+            {
+                if (result == errSSLWouldBlock)
+                {
+                    waiting = YES;
+                }
+                else
+                {
+                    error = [self sslError:result];
+                }
+                
+                // Can't write any new data since we were unable to write the cached data.
+                hasNewDataToWrite = NO;
+            }
+        }
+        
+        if (hasNewDataToWrite)
+        {
+            const uint8_t *buffer = (const uint8_t *)[currentWrite->buffer bytes]
+            + currentWrite->bytesDone
+            + bytesWritten;
+            
+            NSUInteger bytesToWrite = [currentWrite->buffer length] - currentWrite->bytesDone - bytesWritten;
+            
+            if (bytesToWrite > SIZE_MAX) // NSUInteger may be bigger than size_t (write param 3)
+            {
+                bytesToWrite = SIZE_MAX;
+            }
+            
+            size_t bytesRemaining = bytesToWrite;
+            
+            BOOL keepLooping = YES;
+            while (keepLooping)
+            {
+                size_t sslBytesToWrite = MIN(bytesRemaining, 32768);
+                size_t sslBytesWritten = 0;
+                
+                result = SSLWrite(sslContext, buffer, sslBytesToWrite, &sslBytesWritten);
+                
+                if (result == noErr)
+                {
+                    buffer += sslBytesWritten;
+                    bytesWritten += sslBytesWritten;
+                    bytesRemaining -= sslBytesWritten;
+                    
+                    keepLooping = (bytesRemaining > 0);
+                }
+                else
+                {
+                    if (result == errSSLWouldBlock)
+                    {
+                        waiting = YES;
+                        sslWriteCachedLength = sslBytesToWrite;
+                    }
+                    else
+                    {
+                        error = [self sslError:result];
+                    }
+                    
+                    keepLooping = NO;
+                }
+                
+            } // while (keepLooping)
+            
+        } // if (hasNewDataToWrite)
+        
+        #else
 			
-			// 
-			// Writing data using CFStream (over internal TLS)
-			// 
-			
-			const uint8_t *buffer = (const uint8_t *)[currentWrite->buffer bytes] + currentWrite->bytesDone;
-			
-			NSUInteger bytesToWrite = [currentWrite->buffer length] - currentWrite->bytesDone;
-			
-			if (bytesToWrite > SIZE_MAX) // NSUInteger may be bigger than size_t (write param 3)
-			{
-				bytesToWrite = SIZE_MAX;
-			}
-		
-			CFIndex result = CFWriteStreamWrite(writeStream, buffer, (CFIndex)bytesToWrite);
-			LogVerbose(@"CFWriteStreamWrite(%lu) = %li", (unsigned long)bytesToWrite, result);
-		
-			if (result < 0)
-			{
-				error = (__bridge_transfer NSError *)CFWriteStreamCopyError(writeStream);
-			}
-			else
-			{
-				bytesWritten = (size_t)result;
-				
-				// We always set waiting to true in this scenario.
-				// CFStream may have altered our underlying socket to non-blocking.
-				// Thus if we attempt to write without a callback, we may end up blocking our queue.
-				waiting = YES;
-			}
-			
-			#endif
-		}
-		else
-		{
-			#if SECURE_TRANSPORT_MAYBE_AVAILABLE
-			
-			// We're going to use the SSLWrite function.
-			// 
-			// OSStatus SSLWrite(SSLContextRef context, const void *data, size_t dataLength, size_t *processed)
-			// 
-			// Parameters:
-			// context     - An SSL session context reference.
-			// data        - A pointer to the buffer of data to write.
-			// dataLength  - The amount, in bytes, of data to write.
-			// processed   - On return, the length, in bytes, of the data actually written.
-			// 
-			// It sounds pretty straight-forward,
-			// but there are a few caveats you should be aware of.
-			// 
-			// The SSLWrite method operates in a non-obvious (and rather annoying) manner.
-			// According to the documentation:
-			// 
-			//   Because you may configure the underlying connection to operate in a non-blocking manner,
-			//   a write operation might return errSSLWouldBlock, indicating that less data than requested
-			//   was actually transferred. In this case, you should repeat the call to SSLWrite until some
-			//   other result is returned.
-			// 
-			// This sounds perfect, but when our SSLWriteFunction returns errSSLWouldBlock,
-			// then the SSLWrite method returns (with the proper errSSLWouldBlock return value),
-			// but it sets processed to dataLength !!
-			// 
-			// In other words, if the SSLWrite function doesn't completely write all the data we tell it to,
-			// then it doesn't tell us how many bytes were actually written. So, for example, if we tell it to
-			// write 256 bytes then it might actually write 128 bytes, but then report 0 bytes written.
-			// 
-			// You might be wondering:
-			// If the SSLWrite function doesn't tell us how many bytes were written,
-			// then how in the world are we supposed to update our parameters (buffer & bytesToWrite)
-			// for the next time we invoke SSLWrite?
-			// 
-			// The answer is that SSLWrite cached all the data we told it to write,
-			// and it will push out that data next time we call SSLWrite.
-			// If we call SSLWrite with new data, it will push out the cached data first, and then the new data.
-			// If we call SSLWrite with empty data, then it will simply push out the cached data.
-			// 
-			// For this purpose we're going to break large writes into a series of smaller writes.
-			// This allows us to report progress back to the delegate.
-			
-			OSStatus result;
-			
-			BOOL hasCachedDataToWrite = (sslWriteCachedLength > 0);
-			BOOL hasNewDataToWrite = YES;
-			
-			if (hasCachedDataToWrite)
-			{
-				size_t processed = 0;
-				
-				result = SSLWrite(sslContext, NULL, 0, &processed);
-				
-				if (result == noErr)
-				{
-					bytesWritten = sslWriteCachedLength;
-					sslWriteCachedLength = 0;
-					
-					if ([currentWrite->buffer length] == (currentWrite->bytesDone + bytesWritten))
-					{
-						// We've written all data for the current write.
-						hasNewDataToWrite = NO;
-					}
-				}
-				else
-				{
-					if (result == errSSLWouldBlock)
-					{
-						waiting = YES;
-					}
-					else
-					{
-						error = [self sslError:result];
-					}
-					
-					// Can't write any new data since we were unable to write the cached data.
-					hasNewDataToWrite = NO;
-				}
-			}
-			
-			if (hasNewDataToWrite)
-			{
-				const uint8_t *buffer = (const uint8_t *)[currentWrite->buffer bytes]
-				                                        + currentWrite->bytesDone
-				                                        + bytesWritten;
-				
-				NSUInteger bytesToWrite = [currentWrite->buffer length] - currentWrite->bytesDone - bytesWritten;
-				
-				if (bytesToWrite > SIZE_MAX) // NSUInteger may be bigger than size_t (write param 3)
-				{
-					bytesToWrite = SIZE_MAX;
-				}
-				
-				size_t bytesRemaining = bytesToWrite;
-				
-				BOOL keepLooping = YES;
-				while (keepLooping)
-				{
-					size_t sslBytesToWrite = MIN(bytesRemaining, 32768);
-					size_t sslBytesWritten = 0;
-					
-					result = SSLWrite(sslContext, buffer, sslBytesToWrite, &sslBytesWritten);
-					
-					if (result == noErr)
-					{
-						buffer += sslBytesWritten;
-						bytesWritten += sslBytesWritten;
-						bytesRemaining -= sslBytesWritten;
-						
-						keepLooping = (bytesRemaining > 0);
-					}
-					else
-					{
-						if (result == errSSLWouldBlock)
-						{
-							waiting = YES;
-							sslWriteCachedLength = sslBytesToWrite;
-						}
-						else
-						{
-							error = [self sslError:result];
-						}
-						
-						keepLooping = NO;
-					}
-					
-				} // while (keepLooping)
-				
-			} // if (hasNewDataToWrite)
-		
-			#endif
-		}
+        //
+        // Writing data using CFStream (over internal TLS)
+        // 
+        
+        const uint8_t *buffer = (const uint8_t *)[currentWrite->buffer bytes] + currentWrite->bytesDone;
+        
+        NSUInteger bytesToWrite = [currentWrite->buffer length] - currentWrite->bytesDone;
+        
+        if (bytesToWrite > SIZE_MAX) // NSUInteger may be bigger than size_t (write param 3)
+        {
+            bytesToWrite = SIZE_MAX;
+        }
+    
+        CFIndex result = CFWriteStreamWrite(writeStream, buffer, (CFIndex)bytesToWrite);
+        LogVerbose(@"CFWriteStreamWrite(%lu) = %li", (unsigned long)bytesToWrite, result);
+    
+        if (result < 0)
+        {
+            error = (__bridge_transfer NSError *)CFWriteStreamCopyError(writeStream);
+        }
+        else
+        {
+            bytesWritten = (size_t)result;
+            
+            // We always set waiting to true in this scenario.
+            // CFStream may have altered our underlying socket to non-blocking.
+            // Thus if we attempt to write without a callback, we may end up blocking our queue.
+            waiting = YES;
+        }
+        
+        #endif
 	}
 	else
 	{
@@ -5857,6 +5814,8 @@ enum GCDAsyncSocketConfig
 	
 	if ((flags & kStartingReadTLS) && (flags & kStartingWriteTLS))
 	{
+        #if USING_SECURE_TRANSPORT
+        
 		BOOL canUseSecureTransport = YES;
 		
 		#if TARGET_OS_IPHONE
@@ -5883,19 +5842,15 @@ enum GCDAsyncSocketConfig
 				canUseSecureTransport = NO;
 		}
 		#endif
-		
-		if (IS_SECURE_TRANSPORT_AVAILABLE && canUseSecureTransport)
-		{
-		#if SECURE_TRANSPORT_MAYBE_AVAILABLE
-			[self ssl_startTLS];
-		#endif
-		}
-		else
-		{
-		#if TARGET_OS_IPHONE
-			[self cf_startTLS];
-		#endif
-		}
+        
+        if (canUseSecureTransport)
+            [self ssl_startTLS];
+        else
+            [self cf_startTLS];
+        
+        #else
+            [self cf_startTLS];
+        #endif
 	}
 }
 
@@ -5903,7 +5858,7 @@ enum GCDAsyncSocketConfig
 #pragma mark Security via SecureTransport
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#if SECURE_TRANSPORT_MAYBE_AVAILABLE
+#if USING_SECURE_TRANSPORT
 
 - (OSStatus)sslReadWithBuffer:(void *)buffer length:(size_t *)bufferLength
 {
@@ -6573,7 +6528,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 #pragma mark Security via CFStream
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#if TARGET_OS_IPHONE
+#if !USING_SECURE_TRANSPORT
 
 - (void)cf_finishSSLHandshake
 {
@@ -6710,7 +6665,7 @@ static OSStatus SSLWriteFunction(SSLConnectionRef connection, const void *data, 
 #pragma mark CFStream
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#if TARGET_OS_IPHONE
+#if !USING_SECURE_TRANSPORT
 
 + (void)startCFStreamThreadIfNeeded
 {
